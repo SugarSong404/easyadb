@@ -5,12 +5,12 @@ import shutil
 import traceback
 import tempfile
 from PyQt5.QtCore import Qt, QThread, QTimer, QFileSystemWatcher, QUrl
-from PyQt5.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel, QDockWidget, QTabWidget, QPushButton, QMessageBox, QInputDialog, QAction, QComboBox
-from PyQt5.QtGui import QIcon, QDesktopServices
+from PyQt5.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel, QDockWidget, QTabWidget, QPushButton, QMessageBox, QInputDialog, QAction, QComboBox, QListWidget, QLineEdit, QDialog, QMenu, QListWidgetItem
+from PyQt5.QtGui import QIcon, QDesktopServices, QGuiApplication, QFont
 from filepane import FilePane
 from transfers import TransferItem
 from workers import RemoteListWorker, DeviceListWorker, DeviceConnectWorker
-from terminal import ShellTab, open_adb_shell_terminal
+from terminal import ShellTab, open_adb_shell_terminal, GLOBAL_HISTORY, bus
 from utils import run_cmd
 
 
@@ -18,16 +18,23 @@ class MainWindow(QMainWindow):
     def __init__(self, serial):
         super().__init__()
         self.setWindowTitle("easyadb")
-        self.resize(1920, 1500)
+        screen = QGuiApplication.primaryScreen()
+        if screen:
+            geo = screen.availableGeometry()
+            w = min(int(geo.width() * 0.55), 1200)
+            h = min(int(geo.height() * 0.65), 820)
+            self.resize(max(800, w), max(560, h))
+        else:
+            self.resize(1000, 700)
         central = QWidget(self)
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         menubar = self.menuBar()
-        menu_device = menubar.addMenu("设备")
+        menu_device = menubar.addMenu(serial or "设备")
         act_switch = QAction("切换设备", self)
         act_switch.setShortcut("Ctrl+D")
         menu_device.addAction(act_switch)
-        menu_tools = menubar.addMenu("工具")
+        menu_tools = menubar.addMenu("视图")
         act_shell_ext = QAction("打开外部终端", self)
         act_shell_ext.setShortcut("Ctrl+O")
         menu_tools.addAction(act_shell_ext)
@@ -35,17 +42,24 @@ class MainWindow(QMainWindow):
         self.act_shell_toggle.setShortcut("Ctrl+E")
         menu_tools.addSeparator()
         menu_tools.addAction(self.act_shell_toggle)
-        topbar = QHBoxLayout()
-        self.serialLabel = QLabel(f"设备: {serial}", self)
-        topbar.addWidget(self.serialLabel)
-        self.btnSyncTemp = QPushButton("同步修改", self)
-        self.btnSyncTemp.setVisible(False)
+        self.act_commands_toggle = QAction("显示常用指令", self, checkable=True)
+        self.act_commands_toggle.setShortcut("Ctrl+L")
+        menu_tools.addAction(self.act_commands_toggle)
+        device_corner = QWidget(menubar)
+        device_corner_lay = QHBoxLayout(device_corner)
+        device_corner_lay.setContentsMargins(8, 0, 8, 0)
+        device_corner_lay.setSpacing(6)
+        self.btnSyncTemp = QPushButton("同步修改", device_corner)
+        self.btnSyncTemp.setFont(QFont("", 10))
+        self.btnSyncTemp.setVisible(True)
         self.btnSyncTemp.setEnabled(False)
         self.btnSyncTemp.clicked.connect(self.sync_temp_changes)
         self._sync_btn_default_style = self.btnSyncTemp.styleSheet()
-        topbar.addWidget(self.btnSyncTemp)
-        topbar.addStretch(1)
-        layout.addLayout(topbar)
+        device_corner_lay.addWidget(self.btnSyncTemp, 0)
+        try:
+            menubar.setCornerWidget(device_corner, Qt.TopRightCorner)
+        except Exception:
+            pass
         splitter = QSplitter(self)
         self.left = FilePane("本地", is_posix=False, pane_type="local", parent=splitter)
         self.right = FilePane("安卓设备", is_posix=True, pane_type="remote", parent=splitter)
@@ -79,6 +93,8 @@ class MainWindow(QMainWindow):
         corner_lay.setContentsMargins(8, 4, 8, 4)
         self.btnNewLocalShell = QPushButton("新建本机终端", corner)
         self.btnNewAndroidShell = QPushButton("新建安卓终端", corner)
+        self.btnNewLocalShell.setFont(QFont("", 10))
+        self.btnNewAndroidShell.setFont(QFont("", 10))
         self.btnNewLocalShell.setMinimumHeight(28)
         self.btnNewAndroidShell.setMinimumHeight(28)
         self.btnNewLocalShell.setMinimumWidth(100)
@@ -101,11 +117,23 @@ class MainWindow(QMainWindow):
         self.right.deleteRequested.connect(self.on_right_delete)
         self.left.renameRequested.connect(self.on_left_rename)
         self.right.renameRequested.connect(self.on_right_rename)
+        self.left.newFolderRequested.connect(self.on_left_new_folder)
+        self.left.newFileRequested.connect(self.on_left_new_file)
+        self.right.newFolderRequested.connect(self.on_right_new_folder)
+        self.right.newFileRequested.connect(self.on_right_new_file)
+        self.left.refreshRequested.connect(self.refresh_local)
+        self.right.refreshRequested.connect(self.refresh_remote)
         act_switch.triggered.connect(self.switch_device)
         act_shell_ext.triggered.connect(self.open_external_shell)
         self.act_shell_toggle.toggled.connect(self.on_toggle_shell)
         self.btnNewLocalShell.clicked.connect(self.on_new_local_shell)
         self.btnNewAndroidShell.clicked.connect(self.on_new_android_shell)
+        self.commandsDock = QDockWidget("常用指令", self)
+        self.commandsDock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
+        self.commandsWidget = CommonCommandsWidget(self, self.commandsDock)
+        self.commandsDock.setWidget(self.commandsWidget)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.commandsDock)
+        self.commandsDock.show()
         self.init_paths()
         self.refresh_remote()
         self.act_shell_toggle.setChecked(True)
@@ -113,6 +141,16 @@ class MainWindow(QMainWindow):
             self.on_new_android_shell()
         try:
             QTimer.singleShot(0, lambda: self.resizeDocks([self.shellDock], [int(self.height() * 0.35)], Qt.Vertical))
+        except Exception:
+            pass
+        self.act_commands_toggle.toggled.connect(self.on_toggle_commands)
+        try:
+            self.act_commands_toggle.setChecked(True)
+        except Exception:
+            pass
+        try:
+            self.shellDock.visibilityChanged.connect(lambda v: self.act_shell_toggle.setChecked(v))
+            self.commandsDock.visibilityChanged.connect(lambda v: self.act_commands_toggle.setChecked(v))
         except Exception:
             pass
 
@@ -140,6 +178,11 @@ class MainWindow(QMainWindow):
                 self.on_new_android_shell()
         else:
             self.shellDock.hide()
+    def on_toggle_commands(self, checked):
+        if checked:
+            self.commandsDock.show()
+        else:
+            self.commandsDock.hide()
 
     def on_new_local_shell(self):
         tab = ShellTab(self.current_device, self.shellTabs, mode="local")
@@ -346,9 +389,23 @@ class MainWindow(QMainWindow):
     def _is_text_name(self, name: str) -> bool:
         ext = os.path.splitext(name.lower())[1]
         text_exts = {
-            ".txt", ".log", ".json", ".xml", ".yaml", ".yml", ".csv", ".ini", ".conf",
-            ".cfg", ".prop", ".properties", ".sh", ".bash", ".zsh", ".py", ".js",
-            ".ts", ".java", ".gradle", ".md", ".html", ".htm", ".css", ".rb", ".php"
+            ".txt", ".log",
+            ".json", ".xml", ".yaml", ".yml", ".toml",
+            ".csv", ".ini", ".conf", ".cfg", ".config", ".env",
+            ".prop", ".properties",
+            ".md", ".markdown",
+            ".html", ".htm", ".css",
+            ".py", ".pyw",
+            ".js", ".ts", ".jsx", ".tsx",
+            ".java", ".gradle", ".groovy",
+            ".rb", ".php", ".pl", ".pm", ".lua",
+            ".c", ".h", ".hpp", ".hh", ".hxx",
+            ".cc", ".cpp", ".cxx",
+            ".m", ".mm", ".swift",
+            ".go", ".rs", ".kt", ".kts", ".scala",
+            ".sql",
+            ".sh", ".bash", ".zsh",
+            ".ps1", ".psm1", ".bat", ".cmd",
         }
         return ext in text_exts or ext == ""
 
@@ -435,7 +492,7 @@ class MainWindow(QMainWindow):
         root = self._temp_root
         if not os.path.isdir(root):
             self.btnSyncTemp.setEnabled(False)
-            self.btnSyncTemp.setVisible(False)
+            self.btnSyncTemp.setVisible(True)
             try:
                 self.btnSyncTemp.setStyleSheet(self._sync_btn_default_style)
             except Exception:
@@ -536,6 +593,383 @@ class MainWindow(QMainWindow):
             print("远端重命名失败:", old_path, "->", new_path, err or out)
         self.refresh_remote()
 
+    def on_left_new_folder(self, name: str):
+        if not name or any(c in name for c in ("/", "\\")):
+            QMessageBox.warning(self, "提示", "名称不合法")
+            return
+        base = self.left.current_path
+        p = os.path.join(base, name)
+        if os.path.exists(p):
+            QMessageBox.warning(self, "提示", "已存在同名文件或文件夹")
+            return
+        try:
+            os.makedirs(p, exist_ok=False)
+        except Exception as e:
+            QMessageBox.warning(self, "创建失败", str(e))
+            return
+        self.refresh_local()
+
+    def on_left_new_file(self, name: str):
+        if not name or any(c in name for c in ("/", "\\")):
+            QMessageBox.warning(self, "提示", "名称不合法")
+            return
+        base = self.left.current_path
+        p = os.path.join(base, name)
+        if os.path.exists(p):
+            QMessageBox.warning(self, "提示", "已存在同名文件或文件夹")
+            return
+        try:
+            with open(p, "a", encoding="utf-8"):
+                pass
+        except Exception as e:
+            QMessageBox.warning(self, "创建失败", str(e))
+            return
+        self.refresh_local()
+
+    def on_right_new_folder(self, name: str):
+        if not self.current_device:
+            QMessageBox.information(self, "提示", "当前未连接设备")
+            return
+        if not name or "/" in name or "\\" in name:
+            QMessageBox.warning(self, "提示", "名称不合法")
+            return
+        base = self.right.current_path if self.right.current_path else "/"
+        p = posixpath.join(base, name)
+        cmd = f"mkdir -p {shlex.quote(p)}"
+        code, out, err = run_cmd(["adb", "-s", self.current_device, "shell", cmd], timeout=30)
+        if code != 0:
+            QMessageBox.warning(self, "创建失败", err or out or "未知错误")
+            return
+        self.refresh_remote()
+
+    def on_right_new_file(self, name: str):
+        if not self.current_device:
+            QMessageBox.information(self, "提示", "当前未连接设备")
+            return
+        if not name or "/" in name or "\\" in name:
+            QMessageBox.warning(self, "提示", "名称不合法")
+            return
+        base = self.right.current_path if self.right.current_path else "/"
+        p = posixpath.join(base, name)
+        cmd = f"touch {shlex.quote(p)}"
+        code, out, err = run_cmd(["adb", "-s", self.current_device, "shell", cmd], timeout=30)
+        if code != 0:
+            QMessageBox.warning(self, "创建失败", err or out or "未知错误")
+            return
+        self.refresh_remote()
+
+
+class CommonCommandsWidget(QWidget):
+    def __init__(self, main, parent=None):
+        super().__init__(parent)
+        self.main = main
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget(self)
+        self.tabs.setTabPosition(QTabWidget.North)
+        layout.addWidget(self.tabs, 1)
+        saved_container = QWidget(self)
+        saved_lay = QVBoxLayout(saved_container)
+        saved_top = QHBoxLayout()
+        self.btnAddSmall = QPushButton("添加", saved_container)
+        self.btnAddSmall.setFont(QFont("", 10))
+        saved_top.addWidget(self.btnAddSmall, 0)
+        saved_top.addStretch(1)
+        saved_lay.addLayout(saved_top)
+        self.savedList = QListWidget(saved_container)
+        self.savedList.setFont(QFont("", 10))
+        self.savedList.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.savedList.customContextMenuRequested.connect(self.on_saved_context_menu)
+        saved_lay.addWidget(self.savedList, 1)
+        self.tabs.addTab(saved_container, "自定义")
+        history_container = QWidget(self)
+        history_lay = QVBoxLayout(history_container)
+        self.historyList = QListWidget(history_container)
+        self.historyList.setFont(QFont("", 10))
+        self.historyList.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.historyList.customContextMenuRequested.connect(self.on_history_context_menu)
+        history_lay.addWidget(self.historyList, 1)
+        self.tabs.addTab(history_container, "历史")
+        self.savedList.itemDoubleClicked.connect(lambda _: self.on_run_from_list(self.savedList))
+        self.historyList.itemDoubleClicked.connect(lambda _: self.on_run_from_list(self.historyList))
+        self.btnAddSmall.clicked.connect(self.on_add)
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        self._saved_items = []
+        self._refresh_saved_list()
+        self._refresh_history_list()
+        self._last_shell = None
+        try:
+            self.main.shellTabs.currentChanged.connect(self._on_shell_tab_changed)
+        except Exception:
+            pass
+        self._connect_shell_history()
+        try:
+            bus.historyChanged.connect(self._refresh_history_if_active)
+        except Exception:
+            pass
+    def on_add(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("添加常用指令")
+        v = QVBoxLayout(dlg)
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("标题"))
+        title_edit = QLineEdit(dlg)
+        title_edit.setFont(QFont("", 10))
+        row1.addWidget(title_edit, 1)
+        v.addLayout(row1)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("指令"))
+        cmd_edit = QLineEdit(dlg)
+        cmd_edit.setFont(QFont("", 10))
+        row2.addWidget(cmd_edit, 1)
+        v.addLayout(row2)
+        row3 = QHBoxLayout()
+        btn_ok = QPushButton("确定", dlg)
+        btn_ok.setFont(QFont("", 10))
+        btn_cancel = QPushButton("取消", dlg)
+        btn_cancel.setFont(QFont("", 10))
+        row3.addStretch(1)
+        row3.addWidget(btn_ok)
+        row3.addWidget(btn_cancel)
+        v.addLayout(row3)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        try:
+            cmd_edit.setFocus()
+        except Exception:
+            pass
+        if dlg.exec() == QDialog.Accepted:
+            title = title_edit.text().strip()
+            cmd = cmd_edit.text().strip()
+            if not cmd:
+                return
+            if not title:
+                title = cmd
+            self._saved_items.append((title, cmd))
+            self._refresh_saved_list()
+    def on_run_from_list(self, which):
+        it = which.currentItem()
+        if not it:
+            return
+        cmd = (it.data(Qt.UserRole) or "").strip()
+        if not cmd:
+            return
+        tab = None
+        try:
+            cw = self.main.shellTabs.currentWidget()
+            if isinstance(cw, ShellTab):
+                tab = cw
+        except Exception:
+            tab = None
+        if tab is None:
+            try:
+                self.main.on_new_android_shell()
+                cw = self.main.shellTabs.currentWidget()
+                if isinstance(cw, ShellTab):
+                    tab = cw
+            except Exception:
+                tab = None
+        if tab is None:
+            QMessageBox.information(self, "提示", "未找到可用终端")
+            return
+        try:
+            tab.send_command(cmd)
+            try:
+                if not self.main.shellDock.isVisible():
+                    self.main.shellDock.show()
+                    self.main.act_shell_toggle.setChecked(True)
+            except Exception:
+                pass
+            try:
+                self.main.shellTabs.setCurrentWidget(tab)
+            except Exception:
+                pass
+            try:
+                QTimer.singleShot(100, lambda: (tab.view.setFocus(), tab.view.moveCursor(tab.view.textCursor().End), tab.view.ensureCursorVisible()))
+            except Exception:
+                pass
+        except Exception:
+            QMessageBox.warning(self, "执行失败", "指令发送失败")
+    def on_saved_context_menu(self, pos):
+        idx = self.savedList.indexAt(pos)
+        item = self.savedList.item(idx.row()) if idx.isValid() else None
+        if not item:
+            return
+        m = QMenu(self)
+        act_edit = QAction("编辑", self)
+        act_del = QAction("删除", self)
+        m.addAction(act_edit)
+        m.addSeparator()
+        m.addAction(act_del)
+        a = m.exec(self.savedList.viewport().mapToGlobal(pos))
+        if a and a.text() == "删除":
+            self.savedList.takeItem(self.savedList.row(item))
+            try:
+                txt = item.text()
+                self._saved_items = [(t, c) for (t, c) in self._saved_items if t != txt]
+            except Exception:
+                pass
+            return
+        if a and a.text() == "编辑":
+            self._edit_item(item)
+    def _edit_item(self, item: QListWidgetItem):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("编辑常用指令")
+        v = QVBoxLayout(dlg)
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("标题"))
+        title_edit = QLineEdit(dlg)
+        title_edit.setFont(QFont("", 10))
+        title_edit.setText(item.text())
+        row1.addWidget(title_edit, 1)
+        v.addLayout(row1)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("指令"))
+        cmd_edit = QLineEdit(dlg)
+        cmd_edit.setFont(QFont("", 10))
+        cmd_edit.setText(item.data(Qt.UserRole) or "")
+        row2.addWidget(cmd_edit, 1)
+        v.addLayout(row2)
+        row3 = QHBoxLayout()
+        btn_ok = QPushButton("确定", dlg)
+        btn_ok.setFont(QFont("", 10))
+        btn_cancel = QPushButton("取消", dlg)
+        btn_cancel.setFont(QFont("", 10))
+        row3.addStretch(1)
+        row3.addWidget(btn_ok)
+        row3.addWidget(btn_cancel)
+        v.addLayout(row3)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        try:
+            cmd_edit.setFocus()
+        except Exception:
+            pass
+        if dlg.exec() == QDialog.Accepted:
+            title = title_edit.text().strip()
+            cmd = cmd_edit.text().strip()
+            if not cmd:
+                return
+            if not title:
+                title = cmd
+            item.setText(title)
+            item.setData(Qt.UserRole, cmd)
+            # 更新保存集合
+            try:
+                found = False
+                for i, (t, c) in enumerate(self._saved_items):
+                    if t == title or t == item.text():
+                        self._saved_items[i] = (title, cmd)
+                        found = True
+                        break
+                if not found:
+                    self._saved_items.append((title, cmd))
+            except Exception:
+                pass
+    def _refresh_saved_list(self):
+        try:
+            self.savedList.clear()
+            for title, cmd in self._saved_items:
+                it = QListWidgetItem(title)
+                it.setData(Qt.UserRole, cmd)
+                self.savedList.addItem(it)
+        except Exception:
+            pass
+    def _refresh_history_list(self):
+        try:
+            self.historyList.clear()
+            hist = list(GLOBAL_HISTORY)
+            hist = hist[-30:]
+            for cmd in reversed(hist):
+                it = QListWidgetItem(cmd)
+                it.setData(Qt.UserRole, cmd)
+                self.historyList.addItem(it)
+        except Exception:
+            pass
+    def _on_shell_tab_changed(self, idx):
+        self._connect_shell_history()
+        if self.tabs.currentIndex() == 1:
+            self._refresh_history_list()
+    def _connect_shell_history(self):
+        try:
+            cw = self.main.shellTabs.currentWidget()
+            if self._last_shell is cw:
+                return
+            self._last_shell = cw
+            if isinstance(cw, ShellTab):
+                cw.historyChanged.connect(self._refresh_history_if_active)
+        except Exception:
+            pass
+    def _refresh_history_if_active(self):
+        try:
+            if self.tabs.currentIndex() == 1:
+                self._refresh_history_list()
+        except Exception:
+            pass
+    def on_history_context_menu(self, pos):
+        idx = self.historyList.indexAt(pos)
+        item = self.historyList.item(idx.row()) if idx.isValid() else None
+        if not item:
+            return
+        m = QMenu(self)
+        act_bind = QAction("绑定为新指令", self)
+        m.addAction(act_bind)
+        a = m.exec(self.historyList.viewport().mapToGlobal(pos))
+        if a and a.text() == "绑定为新指令":
+            self._bind_history_item(item)
+    def _bind_history_item(self, item: QListWidgetItem):
+        cmd_prefill = (item.data(Qt.UserRole) or "").strip()
+        if not cmd_prefill:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("添加常用指令")
+        v = QVBoxLayout(dlg)
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("标题"))
+        title_edit = QLineEdit(dlg)
+        title_edit.setFont(QFont("", 10))
+        row1.addWidget(title_edit, 1)
+        v.addLayout(row1)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("指令"))
+        cmd_edit = QLineEdit(dlg)
+        cmd_edit.setFont(QFont("", 10))
+        cmd_edit.setText(cmd_prefill)
+        row2.addWidget(cmd_edit, 1)
+        v.addLayout(row2)
+        row3 = QHBoxLayout()
+        btn_ok = QPushButton("确定", dlg)
+        btn_ok.setFont(QFont("", 10))
+        btn_cancel = QPushButton("取消", dlg)
+        btn_cancel.setFont(QFont("", 10))
+        row3.addStretch(1)
+        row3.addWidget(btn_ok)
+        row3.addWidget(btn_cancel)
+        v.addLayout(row3)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        try:
+            cmd_edit.setFocus()
+        except Exception:
+            pass
+        if dlg.exec() == QDialog.Accepted:
+            title = title_edit.text().strip()
+            cmd = cmd_edit.text().strip()
+            if not cmd:
+                return
+            if not title:
+                title = cmd
+            self._saved_items.append((title, cmd))
+            try:
+                self.tabs.setCurrentIndex(0)
+            except Exception:
+                pass
+            self._refresh_saved_list()
+    def on_tab_changed(self, idx):
+        if idx == 0:
+            self._refresh_saved_list()
+        else:
+            self._refresh_history_list()
+
 
 class DeviceSelectionWindow(QMainWindow):
     def __init__(self):
@@ -552,15 +986,20 @@ class DeviceSelectionWindow(QMainWindow):
         layout = QVBoxLayout(central)
         row = QHBoxLayout()
         label = QLabel("设备")
+        label.setFont(QFont("", 10))
         self.combo = QComboBox(self)
+        self.combo.setFont(QFont("", 10))
         self.refresh_btn = QPushButton("刷新", self)
+        self.refresh_btn.setFont(QFont("", 10))
         self.connect_btn = QPushButton("连接", self)
+        self.connect_btn.setFont(QFont("", 10))
         row.addWidget(label)
         row.addWidget(self.combo, 1)
         row.addWidget(self.refresh_btn, 0)
         layout.addLayout(row)
         layout.addStretch(1)
         self.status_label = QLabel("", self)
+        self.status_label.setFont(QFont("", 10))
         layout.addWidget(self.status_label, 0, Qt.AlignLeft)
         layout.addWidget(self.connect_btn, 0, Qt.AlignRight)
         self.refresh_btn.clicked.connect(self.populate)

@@ -3,8 +3,8 @@ import posixpath
 import pathlib
 import json
 from PyQt5.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QEvent, QTimer
-from PyQt5.QtGui import QColor, QDrag
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, QPushButton, QLineEdit, QLabel, QHeaderView, QMenu, QAction
+from PyQt5.QtGui import QColor, QDrag, QFont
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, QPushButton, QLineEdit, QLabel, QHeaderView, QMenu, QAction, QInputDialog
 
 
 class DnDTable(QTableWidget):
@@ -176,7 +176,7 @@ class Breadcrumb(QWidget):
         self.is_posix = is_posix
         self.layout = QHBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
-        self.layout.setSpacing(6)
+        self.layout.setSpacing(4)
         self.current_path = ""
 
     def setPath(self, path):
@@ -212,6 +212,7 @@ class Breadcrumb(QWidget):
                 parts.append((seg, cur))
         for i, (label, full) in enumerate(parts):
             b = QPushButton(label)
+            b.setFont(QFont("", 9))
             b.setCursor(Qt.PointingHandCursor)
             b.setFlat(False)
             b.setStyleSheet(
@@ -220,7 +221,7 @@ class Breadcrumb(QWidget):
                 " color: #ffffff;"
                 " border: 1px solid #5a5a5a;"
                 " border-radius: 6px;"
-                " padding: 4px 8px;"
+                " padding: 2px 6px;"
                 "}"
                 "QPushButton:hover {"
                 " background-color: #505050;"
@@ -233,6 +234,7 @@ class Breadcrumb(QWidget):
             self.layout.addWidget(b)
             if i < len(parts) - 1:
                 sep = QLabel("/" if self.is_posix else "\\")
+                sep.setFont(QFont("", 9))
                 sep.setStyleSheet("color: gray;")
                 self.layout.addWidget(sep)
         self.layout.addStretch(1)
@@ -245,6 +247,9 @@ class FilePane(QWidget):
     deleteRequested = pyqtSignal(list)
     renameRequested = pyqtSignal(dict)
     fileOpenRequested = pyqtSignal(dict)
+    newFolderRequested = pyqtSignal(str)
+    newFileRequested = pyqtSignal(str)
+    refreshRequested = pyqtSignal()
 
     def __init__(self, title, is_posix=False, pane_type="local", parent=None):
         super().__init__(parent)
@@ -266,6 +271,9 @@ class FilePane(QWidget):
         self._up_hover_timer.setInterval(1000)
         self._up_hover_timer.timeout.connect(self._on_up_hover_timeout)
         self.header = QLabel(title, self)
+        self.header.setFont(QFont("", 11))
+        self.path_edit.setFont(QFont("", 10))
+        self.up_btn.setFont(QFont("", 10))
         layout = QVBoxLayout(self)
         top = QHBoxLayout()
         top.addWidget(self.header)
@@ -289,6 +297,9 @@ class FilePane(QWidget):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.on_context_menu)
         self.breadcrumb.pathChanged.connect(self.navigate_to)
+        self.table.setFont(QFont("", 10))
+        self.table.horizontalHeader().setFont(QFont("", 10))
+        self.table.verticalHeader().setDefaultSectionSize(26)
         if isinstance(self.path_edit, QLineEdit):
             self.path_edit.returnPressed.connect(self.return_pressed)
         self.up_btn.clicked.connect(self.navigate_up)
@@ -459,19 +470,52 @@ class FilePane(QWidget):
         return items
 
     def on_context_menu(self, pos: QPoint):
-        items = self.selected_items()
-        if not items:
-            return
+        row = self.table.rowAt(pos.y())
         menu = QMenu(self)
-        act_rename = QAction("重命名", self)
-        act_delete = QAction("删除", self)
-        if len(items) != 1:
-            act_rename.setEnabled(False)
-        menu.addAction(act_rename)
-        menu.addSeparator()
-        menu.addAction(act_delete)
+        # Common actions always available
+        act_refresh = QAction("刷新", self)
+        act_new_folder = QAction("新建文件夹", self)
+        act_new_file = QAction("新建文件", self)
+        menu.addAction(act_refresh)
+        menu.addAction(act_new_folder)
+        menu.addAction(act_new_file)
+        # Item-specific actions
+        items = []
+        if row >= 0:
+            if not self.table.selectedIndexes():
+                try:
+                    self.table.setCurrentCell(row, 0)
+                    self.table.selectRow(row)
+                except Exception:
+                    pass
+            items = self.selected_items()
+        if items:
+            menu.addSeparator()
+            act_rename = QAction("重命名", self)
+            act_delete = QAction("删除", self)
+            if len(items) != 1:
+                act_rename.setEnabled(False)
+            menu.addAction(act_rename)
+            menu.addSeparator()
+            menu.addAction(act_delete)
         action = menu.exec(self.table.viewport().mapToGlobal(pos))
-        if action is act_rename and len(items) == 1:
-            self.renameRequested.emit(items[0])
-        elif action is act_delete:
-            self.deleteRequested.emit(items)
+        if action is act_refresh:
+            self.refreshRequested.emit()
+            return
+        if action is act_new_folder:
+            name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称：")
+            name = (name or "").strip()
+            if ok and name:
+                self.newFolderRequested.emit(name)
+            return
+        if action is act_new_file:
+            name, ok = QInputDialog.getText(self, "新建文件", "文件名：")
+            name = (name or "").strip()
+            if ok and name:
+                self.newFileRequested.emit(name)
+            return
+        if items:
+            if action is act_rename and len(items) == 1:
+                self.renameRequested.emit(items[0])
+            elif action is act_delete:
+                self.deleteRequested.emit(items)

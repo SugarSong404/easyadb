@@ -1,7 +1,7 @@
 import os
 import sys
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QColor, QPalette, QIcon
+from PyQt5.QtGui import QColor, QPalette, QIcon, QFont
 from PyQt5.QtWidgets import QApplication
 from windows import DeviceSelectionWindow
 
@@ -29,8 +29,16 @@ def main():
     palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
     palette.setColor(QPalette.HighlightedText, Qt.white)
     app.setPalette(palette)
+    app.setFont(QFont("", 10))
     selector = DeviceSelectionWindow()
-    selector.resize(600, 240)
+    screen = app.primaryScreen()
+    if screen:
+        geo = screen.availableGeometry()
+        w = max(420, min(int(geo.width() * 0.30), 820))
+        h = max(220, min(int(geo.height() * 0.20), 420))
+        selector.resize(w, h)
+    else:
+        selector.resize(560, 220)
     selector.show()
     sys.exit(app.exec_())
 

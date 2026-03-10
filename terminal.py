@@ -1,9 +1,30 @@
 import os
 import subprocess
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont, QTextCursor, QKeySequence, QIcon
+from PyQt5.QtGui import QFont, QTextCursor, QKeySequence, QIcon, QGuiApplication
 from PyQt5.QtWidgets import QPlainTextEdit, QWidget, QVBoxLayout, QShortcut
-from PyQt5.QtCore import QProcess
+from PyQt5.QtCore import QProcess, pyqtSignal, QObject
+
+class HistoryBus(QObject):
+    historyChanged = pyqtSignal()
+
+bus = HistoryBus()
+GLOBAL_HISTORY = []
+
+def push_global_history(cmd: str):
+    try:
+        if not cmd:
+            return
+        if not GLOBAL_HISTORY or GLOBAL_HISTORY[-1] != cmd:
+            GLOBAL_HISTORY.append(cmd)
+        if len(GLOBAL_HISTORY) > 30:
+            del GLOBAL_HISTORY[: len(GLOBAL_HISTORY) - 30]
+        try:
+            bus.historyChanged.emit()
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def open_adb_shell_terminal(serial: str):
@@ -34,10 +55,64 @@ class TerminalEdit(QPlainTextEdit):
     def keyPressEvent(self, e):
         kc = e.key()
         mod = e.modifiers()
+        if kc in (Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt, Qt.Key_Meta):
+            return
+        if (mod & Qt.ControlModifier) and (mod & Qt.ShiftModifier) and kc == Qt.Key_C:
+            self.copy()
+            return
+        if (mod & Qt.ControlModifier) and (mod & Qt.ShiftModifier) and kc == Qt.Key_V:
+            try:
+                clip = QGuiApplication.clipboard()
+                text = clip.text() if clip else ""
+            except Exception:
+                text = ""
+            if not text:
+                return
+            try:
+                c = self.textCursor()
+                if c.hasSelection():
+                    sel_start = min(c.selectionStart(), c.selectionEnd())
+                    if sel_start < self.input_start:
+                        self.moveCursor(QTextCursor.End)
+                        c = self.textCursor()
+                if c.position() < self.input_start:
+                    self.moveCursor(QTextCursor.End)
+                    c = self.textCursor()
+                self.setTextCursor(c)
+                self.insertPlainText(text)
+                self.ensureCursorVisible()
+            except Exception:
+                pass
+            return
         if (mod & Qt.ControlModifier) and kc in (Qt.Key_C, Qt.Key_Pause):
             if hasattr(self.parent(), "send_interrupt"):
                 self.parent().send_interrupt()
             return
+        try:
+            c0 = self.textCursor()
+            has_sel = c0.hasSelection()
+            if has_sel:
+                sel_start = min(c0.selectionStart(), c0.selectionEnd())
+            else:
+                sel_start = c0.position()
+            is_text_input = bool(getattr(e, "text", lambda: "")()) and not (mod & Qt.ControlModifier) and not (mod & Qt.AltModifier)
+            is_edit_key = kc in (Qt.Key_Backspace, Qt.Key_Delete, Qt.Key_Return, Qt.Key_Enter, Qt.Key_Tab)
+            should_redirect = is_text_input or is_edit_key
+            if should_redirect and sel_start < self.input_start:
+                self.moveCursor(QTextCursor.End)
+        except Exception:
+            pass
+        if kc == Qt.Key_Tab:
+            try:
+                if hasattr(self.parent(), "handle_tab"):
+                    cur = self._current_input_text()
+                    rel = self.textCursor().position() - self.input_start
+                    new_text = self.parent().handle_tab(cur, rel)
+                    if isinstance(new_text, str):
+                        self._replace_current_input(new_text)
+                    return
+            except Exception:
+                return
         if kc == Qt.Key_Up:
             try:
                 if hasattr(self.parent(), "history_prev_text"):
@@ -89,7 +164,9 @@ class TerminalEdit(QPlainTextEdit):
                 self.parent().send_command(line)
             return
         if self.textCursor().position() < self.input_start:
-            self.moveCursor(QTextCursor.End)
+            is_text_input = bool(getattr(e, "text", lambda: "")()) and not (mod & Qt.ControlModifier) and not (mod & Qt.AltModifier)
+            if is_text_input or kc in (Qt.Key_Backspace, Qt.Key_Delete, Qt.Key_Return, Qt.Key_Enter, Qt.Key_Tab):
+                self.moveCursor(QTextCursor.End)
         super().keyPressEvent(e)
 
     def append_output(self, text):
@@ -124,6 +201,7 @@ class TerminalEdit(QPlainTextEdit):
 
 
 class ShellTab(QWidget):
+    historyChanged = pyqtSignal()
     def __init__(self, serial, parent=None, mode="android"):
         super().__init__(parent)
         self.serial = serial
@@ -141,6 +219,7 @@ class ShellTab(QWidget):
         lay.addWidget(self.view, 1)
         self._history = []
         self._hist_idx = None
+        self._last_was_tab = False
         self.proc.readyReadStandardOutput.connect(self.on_stdout)
         self.proc.readyReadStandardError.connect(self.on_stderr)
         self.proc.finished.connect(self.on_finished)
@@ -199,9 +278,19 @@ class ShellTab(QWidget):
                             data = data[len(prefix):]
                             break
                     self.last_command = ""
+                if self.mode == "android" and getattr(self, "_last_was_tab", False):
+                    try:
+                        while data.startswith("\t") or data.startswith("^I"):
+                            if data.startswith("^I"):
+                                data = data[2:]
+                            elif data.startswith("\t"):
+                                data = data[1:]
+                            else:
+                                break
+                    except Exception:
+                        pass
+                    self._last_was_tab = False
                 self.view.append_output(data)
-                if self.mode == "android":
-                    self._arm_prompt_timer()
         except Exception:
             pass
 
@@ -209,9 +298,19 @@ class ShellTab(QWidget):
         try:
             data = bytes(self.proc.readAllStandardError()).decode("utf-8", "ignore")
             if data:
+                if self.mode == "android" and getattr(self, "_last_was_tab", False):
+                    try:
+                        while data.startswith("\t") or data.startswith("^I"):
+                            if data.startswith("^I"):
+                                data = data[2:]
+                            elif data.startswith("\t"):
+                                data = data[1:]
+                            else:
+                                break
+                    except Exception:
+                        pass
+                    self._last_was_tab = False
                 self.view.append_output(data)
-                if self.mode == "android":
-                    self._arm_prompt_timer()
         except Exception:
             pass
 
@@ -232,7 +331,6 @@ class ShellTab(QWidget):
             except Exception:
                 pass
             self.view.moveCursor(self.view.textCursor().End)
-            self._arm_prompt_timer()
             return
         s = line.strip()
         if not s:
@@ -276,6 +374,164 @@ class ShellTab(QWidget):
         self._local_proc.readyReadStandardError.connect(self._on_local_stderr)
         self._local_proc.finished.connect(self._on_local_finished)
         self._local_proc.start(program, args)
+
+    def handle_tab(self, current_text: str, cursor_offset: int):
+        if self.mode == "android":
+            try:
+                return self._android_tab_complete(current_text, cursor_offset)
+            except Exception:
+                return None
+        try:
+            return self._local_tab_complete(current_text, cursor_offset)
+        except Exception:
+            return None
+
+    def _local_tab_complete(self, current_text: str, cursor_offset: int):
+        prefix = current_text[: max(0, cursor_offset)]
+        if not prefix or prefix.endswith((" ", "\t")):
+            return None
+        token_start = max(prefix.rfind(" "), prefix.rfind("\t")) + 1
+        token = prefix[token_start:]
+        quoted = False
+        quote_char = ""
+        if token and token[0] in ('"', "'"):
+            quoted = True
+            quote_char = token[0]
+            token = token[1:]
+        token = token.replace("/", os.sep)
+        if os.altsep:
+            token = token.replace(os.altsep, os.sep)
+        base_dir = token
+        part = ""
+        if token.endswith(os.sep):
+            base_dir = token
+            part = ""
+        else:
+            base_dir = os.path.dirname(token)
+            part = os.path.basename(token)
+        search_dir = base_dir
+        if not os.path.isabs(search_dir):
+            search_dir = os.path.abspath(os.path.join(self._local_cwd or os.getcwd(), search_dir))
+        if not os.path.isdir(search_dir):
+            return None
+        try:
+            entries = os.listdir(search_dir)
+        except Exception:
+            return None
+        matches = [n for n in entries if n.lower().startswith(part.lower())]
+        if not matches:
+            return None
+        matches.sort(key=lambda s: s.lower())
+        common = matches[0]
+        for m in matches[1:]:
+            i = 0
+            limit = min(len(common), len(m))
+            while i < limit and common[i].lower() == m[i].lower():
+                i += 1
+            common = common[:i]
+            if not common:
+                break
+        if len(matches) == 1:
+            common = matches[0]
+        if not common or common.lower() == part.lower():
+            return None
+        completed = os.path.join(base_dir, common) if base_dir else common
+        if quoted:
+            completed = quote_char + completed
+        return current_text[:token_start] + completed + current_text[token_start + (len(prefix) - token_start):]
+
+    def _android_tab_complete(self, current_text: str, cursor_offset: int):
+        prefix = current_text[: max(0, cursor_offset)]
+        if not prefix or prefix.endswith((" ", "\t")):
+            return None
+        token_start = max(prefix.rfind(" "), prefix.rfind("\t")) + 1
+        token = prefix[token_start:]
+        quoted = False
+        quote_char = ""
+        if token and token[0] in ('"', "'"):
+            quoted = True
+            quote_char = token[0]
+            token = token[1:]
+        # 路径补全（含 /）
+        if "/" in token or token.startswith("/"):
+            base_dir = token
+            part = ""
+            if token.endswith("/"):
+                base_dir = token
+                part = ""
+            else:
+                base_dir = os.path.dirname(token)
+                part = os.path.basename(token)
+            dir_arg = base_dir if base_dir else "/"
+            try:
+                result = subprocess.run(["adb", "-s", self.serial, "shell", "ls", "-1", dir_arg], capture_output=True, text=True, timeout=1.5)
+                if result.returncode != 0:
+                    return None
+                entries = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            except Exception:
+                return None
+            matches = [n for n in entries if n.lower().startswith(part.lower())]
+            if not matches:
+                return None
+            matches.sort(key=lambda s: s.lower())
+            common = matches[0]
+            for m in matches[1:]:
+                i = 0
+                limit = min(len(common), len(m))
+                while i < limit and common[i].lower() == m[i].lower():
+                    i += 1
+                common = common[:i]
+                if not common:
+                    break
+            if len(matches) == 1:
+                common = matches[0]
+            if not common or common.lower() == part.lower():
+                return None
+            completed = (base_dir + common) if base_dir.endswith("/") else (base_dir + "/" + common)
+            if quoted:
+                completed = quote_char + completed
+            return current_text[:token_start] + completed + current_text[token_start + (len(prefix) - token_start):]
+        # 命令补全（从 PATH 搜索）
+        try:
+            r = subprocess.run(["adb", "-s", self.serial, "shell", "sh", "-lc", "echo \"$PATH\""], capture_output=True, text=True, timeout=1.5)
+            if r.returncode != 0:
+                return None
+            paths = [p for p in (r.stdout.strip().split(":")) if p]
+        except Exception:
+            return None
+        entries = set()
+        for p in paths[:10]:
+            try:
+                lr = subprocess.run(["adb", "-s", self.serial, "shell", "ls", "-1", p], capture_output=True, text=True, timeout=1.0)
+                if lr.returncode == 0:
+                    for line in lr.stdout.splitlines():
+                        s = line.strip()
+                        if s:
+                            entries.add(s)
+            except Exception:
+                continue
+        part = token
+        matches = [n for n in entries if n.lower().startswith(part.lower())]
+        if not matches:
+            return None
+        matches.sort(key=lambda s: s.lower())
+        common = matches[0]
+        for m in matches[1:]:
+            i = 0
+            limit = min(len(common), len(m))
+            while i < limit and common[i].lower() == m[i].lower():
+                i += 1
+            common = common[:i]
+            if not common:
+                break
+        if len(matches) == 1:
+            common = matches[0]
+        if not common or common.lower() == part.lower():
+            return None
+        completed = common
+        if quoted:
+            completed = quote_char + completed
+        return current_text[:token_start] + completed + current_text[token_start + (len(prefix) - token_start):]
 
     def send_interrupt(self):
         try:
@@ -337,6 +593,10 @@ class ShellTab(QWidget):
             if not self._history or self._history[-1] != cmd:
                 self._history.append(cmd)
             self._hist_idx = None
+            try:
+                push_global_history(cmd)
+            except Exception:
+                pass
         except Exception:
             pass
 
